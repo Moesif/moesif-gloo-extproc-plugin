@@ -1,179 +1,158 @@
+use std::time::Duration;
+
 use crate::config::Config;
 use crate::utils::*;
+use log::{info, trace};
 use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method};
 
 use crate::event::Event;
 use bytes::Bytes;
-use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 type CallbackType = Box<dyn Fn(Vec<(String, String)>, Option<Vec<u8>>) + Send>;
 
-#[derive(Default)]
+#[derive(Clone)]
 pub struct EventRootContext {
     pub config: Config,
-    pub event_byte_buffer: Mutex<Vec<Bytes>>, // Holds serialized, complete events
-    // context_id: String,
-    is_start: bool,
+    pub event_sender: mpsc::Sender<Bytes>,
+    pub client: Client,
 }
 
 impl EventRootContext {
     pub fn new(config: Config) -> Self {
-        EventRootContext {
-            config,
-            event_byte_buffer: Mutex::new(Vec::new()),
-            // context_id: String::new(),
-            is_start: true,
+        let client = Client::builder()
+            .timeout(Duration::from_millis(config.env.connection_timeout as u64))
+            .build()
+            .expect("Failed to build HTTP client");
+
+        let (event_sender, event_receiver) = mpsc::channel::<Bytes>(config.env.queue_max_size);
+
+        let root_context = EventRootContext {
+            config: config.clone(),
+            event_sender: event_sender,
+            client: client.clone(),
+        };
+
+        let cloned_context = root_context.clone();
+        // Start background task to process events
+        tokio::spawn(async move {
+            cloned_context.run_event_processor(event_receiver).await;
+        });
+
+        root_context
+    }
+
+    pub async fn push_event(&self, event: Event) {
+        match serde_json::to_vec(&event) {
+            Ok(event_bytes) => {
+                // Send event to the channel, await if queue is full
+                if let Err(e) = self.event_sender.send(Bytes::from(event_bytes)).await {
+                    log::error!("Failed to send event to queue: {:?}", e);
+                } else {
+                    log::trace!("Event sent to queue: {:?}", event);
+                }
+            },
+            Err(e) => {
+                log::error!("Failed to serialize event: {:?}", e);
+            }
         }
     }
 
-    async fn write_events_json(&self, events: Vec<Bytes>) -> Bytes {
+
+    async fn run_event_processor(&self, mut event_receiver: mpsc::Receiver<Bytes>) {
+        let mut batcher = Batcher::new(
+            self.config.env.batch_max_size,
+            self.config.env.batch_max_wait,
+        );
+
+        loop {
+            tokio::select! {
+                Some(event) = event_receiver.recv() => {
+                    batcher.handle_new_event(event).await;
+                    if batcher.should_flush() {
+                        self.flush_buffer(&mut batcher).await;
+                    }
+                },
+                _ = tokio::time::sleep(batcher.calculate_timeout()), if batcher.has_events() => {
+                    self.flush_buffer(&mut batcher).await;
+                },
+            }
+        }
+    }
+
+    async fn flush_buffer(&self, batcher: &mut Batcher) {
+        self.send_batch(&batcher.buffer).await;
+        batcher.reset();
+    }
+
+    async fn send_batch(&self, buffer: &Vec<Bytes>) {
+        if buffer.is_empty() {
+            return;
+        }
+
+        let body = self.write_events_json(buffer).await;
+        info!("Posting {} events.", buffer.len());
+
+        if let Err(e) = self
+            .dispatch_http_request(
+                "POST",
+                "/v1/events/batch",
+                body,
+                Box::new(|headers, _| {
+                    let config_etag = get_header(&headers, "X-Moesif-Config-Etag");
+                    let rules_etag = get_header(&headers, "X-Moesif-Rules-Etag");
+                    trace!(
+                        "Event Response eTags: config={:?} rules={:?}",
+                        config_etag,
+                        rules_etag
+                    );
+                }),
+            )
+            .await
+        {
+            log::error!("Failed to dispatch HTTP request: {:?}", e);
+        }
+    }
+
+    async fn write_events_json(&self, events: &Vec<Bytes>) -> Bytes {
         log::trace!("Entering write_events_json with {} events.", events.len());
 
-        let total_size: usize = events.iter().map(|event_bytes| event_bytes.len()).sum();
+        // Calculate the total size needed for all event bytes
+        let total_events_size: usize = events.iter().map(|event_bytes| event_bytes.len()).sum();
 
-        let json_array_size = if !events.is_empty() {
-            total_size + events.len() - 1 + 2
+        // Each comma between events adds 1 byte, '[' and ']' add 2 bytes
+        let num_commas = if events.len() > 1 {
+            events.len() - 1
         } else {
-            2 // Just for the empty array '[]'
+            0
         };
+        let json_array_size = total_events_size + num_commas + 2;
+
         let mut event_json_array = Vec::with_capacity(json_array_size);
 
         event_json_array.push(b'[');
+
         for (i, event_bytes) in events.iter().enumerate() {
             if i > 0 {
                 event_json_array.push(b',');
             }
-            event_json_array.extend(event_bytes);
+            event_json_array.extend_from_slice(event_bytes);
 
             log::trace!(
-                "Adding event to JSON array: {:?}",
-                std::str::from_utf8(event_bytes).unwrap_or("Invalid UTF-8")
+                "Adding event to JSON array: {}",
+                String::from_utf8_lossy(event_bytes)
             );
         }
+
         event_json_array.push(b']');
 
-        let final_json = std::str::from_utf8(&event_json_array).unwrap_or("Invalid UTF-8");
-        log::trace!("Final JSON array being sent: {}", final_json);
         log::trace!(
-            "Exiting write_events_json with JSON array size {} bytes.",
-            event_json_array.len()
+            "Final JSON array being sent, length {}: {}",
+            event_json_array.len(),
+            String::from_utf8_lossy(&event_json_array)
         );
         event_json_array.into() // Return as Bytes
-    }
-
-    pub async fn check_and_flush_buffer(&mut self) {
-        log::trace!("Entering add_event.");
-
-        let mut immediate_send = false;
-
-        {
-            let buffer = self.event_byte_buffer.lock().await;
-            log::trace!(
-                "Acquired lock on event_byte_buffer. Current buffer size: {}",
-                buffer.len()
-            );
-
-            if self.is_start {
-                // First event in the runtime, perform special action
-                immediate_send = true;
-                self.is_start = false; // Ensure this block only runs once
-                log::trace!("First event processed, setting is_start to false.");
-            } else if buffer.len() >= self.config.env.batch_max_size {
-                // Buffer full, send immediately
-                immediate_send = true;
-                log::trace!("Buffer size has reached maximum capacity, triggering flush.");
-            }
-        }
-
-        if immediate_send {
-            self.drain_and_send(1).await;
-        }
-    }
-
-    pub async fn drain_and_send(&self, drain_at_least: usize) {
-        log::trace!(
-            "Entering drain_and_send with drain_at_least size: {}",
-            drain_at_least
-        );
-
-        let mut attempts = 0;
-        loop {
-            match self.event_byte_buffer.try_lock() {
-                Ok(mut buffer) => {
-                    log::trace!(
-                        "Acquired lock on event_byte_buffer for draining after {} attempts. Current buffer size: {}",
-                        attempts, buffer.len()
-                    );
-
-                    while buffer.len() >= drain_at_least {
-                        log::trace!(
-                            "Buffer size {} >= {}. Draining and sending events.",
-                            buffer.len(),
-                            drain_at_least
-                        );
-
-                        log::trace!("Config batch_max_size: {}", self.config.env.batch_max_size);
-                        let end = std::cmp::min(buffer.len(), self.config.env.batch_max_size);
-                        log::trace!("Calculated end for draining: {}", end);
-
-                        let events_to_send: Vec<Bytes> = buffer.drain(..end).collect();
-                        log::trace!(
-                            "Drained {} events from buffer for sending.",
-                            events_to_send.len()
-                        );
-                        log::trace!("Buffer size after draining: {}", buffer.len());
-
-                        let body = self.write_events_json(events_to_send).await;
-
-                        log::info!("Dispatching HTTP request with {} events.", end);
-
-                        if let Err(e) = self
-                            .dispatch_http_request(
-                                "POST",
-                                "/v1/events/batch",
-                                body,
-                                Box::new(|headers, _| {
-                                    let config_etag = get_header(&headers, "X-Moesif-Config-Etag");
-                                    let rules_etag = get_header(&headers, "X-Moesif-Rules-Etag");
-                                    log::info!(
-                                        "Event Response eTags: config={:?} rules={:?}",
-                                        config_etag,
-                                        rules_etag
-                                    );
-                                }),
-                            )
-                            .await
-                        {
-                            log::error!("Failed to dispatch HTTP request: {:?}", e);
-                        }
-
-                        log::trace!(
-                            "Events drained and sent. Current buffer size: {}",
-                            buffer.len()
-                        );
-                    }
-
-                    log::trace!(
-                        "Exiting drain_and_send. Current buffer size: {}",
-                        buffer.len()
-                    );
-                    break;
-                }
-                Err(_) => {
-                    attempts += 1;
-                    log::warn!("Failed to acquire lock on event_byte_buffer; will retry after a short delay (attempt: {}).", attempts);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
-    }
-
-    pub async fn push_event(&mut self, event: &Event) {
-        let mut buffer = self.event_byte_buffer.lock().await;
-        buffer.push(serialize_event_to_bytes(event));
-        log::trace!("Event pushed to event_byte_buffer.");
     }
 
     async fn dispatch_http_request(
@@ -185,7 +164,6 @@ impl EventRootContext {
     ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         log::trace!("Entering dispatch_http_request.");
 
-        let client = Client::new();
         let url = format!("{}{}", self.config.env.base_uri, path);
 
         let method = Method::from_bytes(method.as_bytes())?;
@@ -212,7 +190,8 @@ impl EventRootContext {
             std::str::from_utf8(&body).unwrap_or_default()
         );
 
-        let response = client
+        let response = self
+            .client
             .request(method, &url)
             .headers(headers)
             .body(body)
@@ -235,6 +214,57 @@ impl EventRootContext {
 
         log::trace!("Exiting dispatch_http_request.");
 
-        Ok(12345) // Replace with actual token or ID logic if needed
+        Ok(status.as_u16().into())
+    }
+}
+
+struct Batcher {
+    buffer: Vec<Bytes>,
+    first_event_time: Option<tokio::time::Instant>,
+    max_size: usize,
+    max_wait: u64,
+}
+
+impl Batcher {
+    fn new(max_size: usize, max_wait: u64) -> Self {
+        Batcher {
+            buffer: Vec::new(),
+            first_event_time: None,
+            max_size,
+            max_wait,
+        }
+    }
+
+    fn calculate_timeout(&self) -> Duration {
+        if let Some(time) = self.first_event_time {
+            let elapsed = time.elapsed();
+            if elapsed >= Duration::from_millis(self.max_wait) {
+                Duration::from_millis(0)
+            } else {
+                Duration::from_millis(self.max_wait) - elapsed
+            }
+        } else {
+            Duration::from_secs(u64::MAX)
+        }
+    }
+
+    async fn handle_new_event(&mut self, event: Bytes) {
+        if self.first_event_time.is_none() {
+            self.first_event_time = Some(tokio::time::Instant::now());
+        }
+        self.buffer.push(event);
+    }
+
+    fn should_flush(&self) -> bool {
+        self.buffer.len() >= self.max_size
+    }
+
+    fn has_events(&self) -> bool {
+        self.first_event_time.is_some()
+    }
+
+    fn reset(&mut self) {
+        self.first_event_time = None;
+        self.buffer.clear();
     }
 }

@@ -1,28 +1,31 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env};
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct Config {
     pub env: EnvConfig,
-    // pub _event_queue_id: u32,
 }
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct EnvConfig {
     pub moesif_application_id: String,
+    // use serde to make these values to_lowercase
     pub user_id_header: Option<String>,
     pub company_id_header: Option<String>,
     #[serde(default = "default_batch_max_size")]
     pub batch_max_size: usize,
     #[serde(default = "default_batch_max_wait")]
-    pub batch_max_wait: usize,
-    #[serde(default = "default_upstream")]
-    pub upstream: String,
+    pub batch_max_wait: u64,
+    #[serde(default = "default_queue_max_size")]
+    pub queue_max_size: usize,
+    #[serde(default = "default_grpc_processing_queue_size")]
+    pub grpc_processing_queue_size: usize,
+    #[serde(default = "default_base_uri")]
     pub base_uri: String,
     #[serde(default = "default_debug")]
     pub debug: bool,
     #[serde(default = "connection_timeout")]
-    pub connection_timeout: usize,
+    pub connection_timeout: u64,
     pub rust_log: Option<String>,
 }
 
@@ -30,22 +33,78 @@ fn default_batch_max_size() -> usize {
     100
 }
 
-fn default_batch_max_wait() -> usize {
+fn default_batch_max_wait() -> u64 {
     2000
 }
 
-fn default_upstream() -> String {
-    "outbound|443||api.moesif.net".to_string()
+fn default_queue_max_size() -> usize {
+    10000
+}
+
+fn default_grpc_processing_queue_size() -> usize {
+    4
+}
+
+fn default_base_uri() -> String {
+    "https://api.moesif.net".to_string()
 }
 
 fn default_debug() -> bool {
     false
 }
 
-fn connection_timeout() -> usize {
+fn connection_timeout() -> u64 {
     5000
 }
 
+impl EnvConfig {
+    pub fn new() -> Self {
+        let mut env = match envy::from_env::<EnvConfig>() {
+            Ok(env) => env,
+            Err(_) => {
+                log::error!("Failed to load environment variables, using defaults.");
+                EnvConfig::default()
+            }
+        };
+        env.post_process();
+        if let Err(e) = env.validate() {
+            log::error!("Invalid configuration: {}", e);
+        }
+        env
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.moesif_application_id.is_empty() {
+            return Err("moesif_application_id cannot be empty.".to_string());
+        }
+        if self.batch_max_size == 0 {
+            return Err("batch_max_size cannot be zero.".to_string());
+        }
+        if self.batch_max_wait == 0 {
+            return Err("batch_max_wait cannot be zero.".to_string());
+        }
+        if self.queue_max_size == 0 {
+            return Err("queue_max_size cannot be zero.".to_string());
+        }
+        if self.grpc_processing_queue_size == 0 {
+            return Err("grpc_processing_queue_size cannot be zero.".to_string());
+        }
+        if self.connection_timeout == 0 {
+            return Err("connection_timeout cannot be zero.".to_string());
+        }
+        if self.base_uri.is_empty() {
+            return Err("base_uri cannot be empty.".to_string());
+        }
+        Ok(())
+    }
+    fn post_process(&mut self) {
+        self.user_id_header = self.user_id_header.as_ref().map(|s| s.to_lowercase());
+        self.company_id_header = self.company_id_header.as_ref().map(|s| s.to_lowercase());
+    }
+}
+
+
+//TODO load dynamic from config api on update
 #[derive(Default, Serialize, Deserialize, Debug)]
 pub struct AppConfigResponse {
     pub org_id: String,
@@ -78,65 +137,4 @@ pub struct RegexRule {
 pub struct RegexCondition {
     pub path: String,
     pub value: String,
-}
-
-impl EnvConfig {
-    pub fn new() -> Self {
-        let moesif_application_id =
-            env::var("MOESIF_APPLICATION_ID").unwrap_or_else(|_| String::new());
-        let user_id_header = env::var("USER_ID_HEADER").ok();
-        let company_id_header = env::var("COMPANY_ID_HEADER").ok();
-        let batch_max_size = env::var("BATCH_MAX_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(default_batch_max_size);
-        let batch_max_wait = env::var("BATCH_MAX_WAIT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(default_batch_max_wait);
-
-        // Use default_upstream() directly in the struct initialization
-        let upstream = env::var("UPSTREAM").unwrap_or_else(|_| default_upstream());
-
-        // Attempt to parse base_uri from upstream, fallback to default_base_uri
-        let base_uri = Self::parse_upstream_url(&upstream).unwrap();
-
-        let debug = env::var("DEBUG")
-            .ok()
-            .map_or_else(default_debug, |v| v == "true");
-
-        let rust_log = env::var("RUST_LOG").ok();
-        let connection_timeout = env::var("CONNECTION_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(connection_timeout);
-
-        let config = EnvConfig {
-            moesif_application_id,
-            user_id_header,
-            company_id_header,
-            batch_max_size,
-            batch_max_wait,
-            upstream,
-            base_uri,
-            debug,
-            connection_timeout,
-            rust_log,
-        };
-
-        log::info!("Config initialized: {:?}", config); // Add this line to print the entire config
-
-        config
-    }
-
-    fn parse_upstream_url(upstream: &str) -> Result<String, ()> {
-        // Logic to parse the upstream string and extract base_uri
-        // Example logic assuming the upstream format: "outbound|443||api.moesif.net"
-        let parts: Vec<&str> = upstream.split('|').collect();
-        if parts.len() == 4 {
-            Ok(format!("https://{}", parts[3]))
-        } else {
-            Err(())
-        }
-    }
 }

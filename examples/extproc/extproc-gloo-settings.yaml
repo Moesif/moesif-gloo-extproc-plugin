@@ -9,5 +9,7 @@ spec:
         name: "moesif-extproc-plugin"
         namespace: "gloo-system"
     processingMode:
-      requestHeaderMode: "SEND"
-      responseHeaderMode: "SEND"
+      requestHeaderMode: SEND
+      responseHeaderMode: SEND
+      requestBodyMode: STREAMED
+      responseBodyMode: STREAMED

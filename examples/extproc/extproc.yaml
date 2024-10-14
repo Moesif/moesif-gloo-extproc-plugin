@@ -15,13 +15,13 @@ spec:
     spec:
       containers:
         - name: moesif-extproc-plugin
-          image: gcr.io/solo-test-236622/moesif-extproc-plugin:latest
+          image: docker.io/moesif/moesif-gloo-extproc-plugin:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 50051
           env:
             - name: MOESIF_APPLICATION_ID
-              value: $MOESIF_APP_ID # <YOUR APPLICATION ID HERE>
+              value: "<Your Moesif Application Id Required>"
             - name: USER_ID_HEADER
               value: "X-User-Example-Header"  
             - name: COMPANY_ID_HEADER
@@ -31,7 +31,7 @@ spec:
             - name: DEBUG
               value: "false" 
             - name: RUST_LOG
-              value: info
+              value: trace
 ---
 apiVersion: v1
 kind: Service

@@ -6,21 +6,21 @@ TAG=${1:-latest}
 # Determine build variant: debug or release
 if [ "$2" == "debug" ]; then
     BUILD_VARIANT=debug
-    BUILD_FLAGS=""
+    BUILD_FLAGS=" --target x86_64-unknown-linux-gnu"
 else
     BUILD_VARIANT=release
-    BUILD_FLAGS="--release"
+    BUILD_FLAGS="--release --target x86_64-unknown-linux-gnu"
 fi
 
 # Docker image names
-# REPO=docker.io/moesif
-REPO=gcr.io/solo-test-236622
+REPO=docker.io/brianmoesif
+# REPO=gcr.io/solo-test-236622
 
 # Get the directory of this script to make sure we can run it from anywhere
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="$SCRIPT_DIR/../.."
-SOURCE="$BASE_DIR/moesif-extproc"
-OUTPUT="$SOURCE/target/$BUILD_VARIANT"
+BASE_DIR=$(realpath "$SCRIPT_DIR")
+SOURCE="$BASE_DIR"
+OUTPUT="./target/$BUILD_VARIANT"
 
 # Grab the version from Cargo.toml
 VERSION=$(grep -m 1 '^version =' "$SOURCE/Cargo.toml" | awk -F\" '{print $2}')
@@ -33,6 +33,7 @@ else
     TAG_ARTIFACT_VERSION=$REPO/moesif-extproc-plugin:$VERSION
     TAG_ARTIFACT_LATEST=$REPO/moesif-extproc-plugin:latest
 fi
+
 # Step 1: Build the Rust binary locally
 echo "Building the Rust binary..."
 cargo build --manifest-path $SOURCE/Cargo.toml $BUILD_FLAGS
@@ -48,7 +49,8 @@ if [ -z "$VERSION" ]; then
     echo "Building the Docker image with tag: latest..."
     docker build \
     -t $TAG_ARTIFACT \
-    -f $SOURCE/Dockerfile \
+    -f $SOURCE/runtime.dockerfile \
+    --platform linux/amd64 \
     --build-arg BINARY_PATH=$OUTPUT/moesif_envoy_extproc_plugin \
     $SOURCE
 else
@@ -56,7 +58,8 @@ else
     docker build \
     -t $TAG_ARTIFACT_VERSION \
     -t $TAG_ARTIFACT_LATEST \
-    -f $SOURCE/Dockerfile \
+    -f $SOURCE/runtime.dockerfile \
+    --platform linux/amd64 \
     --build-arg BINARY_PATH=$OUTPUT/moesif_envoy_extproc_plugin \
     $SOURCE
 fi

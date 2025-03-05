@@ -13,8 +13,7 @@ else
 fi
 
 # Docker image names
-REPO=docker.io/brianmoesif
-# REPO=gcr.io/solo-test-236622
+REPO=docker.io/moesif
 
 # Get the directory of this script to make sure we can run it from anywhere
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

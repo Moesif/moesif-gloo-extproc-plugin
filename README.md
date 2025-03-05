@@ -5,7 +5,7 @@ The Moesif Gloo Gateway ExtProc plugin captures API traffic from [Solo.io Gloo G
 - **Gloo Gateway** is a powerful ingress controller and an advanced API and AI gateway, natively supporting the Kubernetes Gateway API.
 - **Moesif** is an API analytics and monetization platform.
 
-[Source Code on GitHub](https://github.com/solo-io/moesif-gloo-extproc-plugin)
+[Source Code on GitHub](https://github.com/Moesif/moesif-gloo-extproc-plugin)
 
 ## How to Install
 
@@ -42,7 +42,7 @@ spec:
     spec:
       containers:
         - name: moesif-extproc-plugin
-          image: gcr.io/solo-test-236622/moesif-extproc-plugin:latest
+          image: docker.io/moesif/moesif-gloo-extproc-plugin:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 50051

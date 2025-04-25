@@ -247,7 +247,7 @@ server: envoy
 
 After the configuration is applied, check your [Moesif account](https://www.moesif.com) to see the captured events and verify that the plugin is working as expected.
 
-*Note:* If request/response headers or body values are missing in Moesif, Gloo requires explicit configuration in order to send that information to the Moesif ExtProc integration.  See the processingModes section of the above example settings command and `examples/extproc/extproc-gloo-settings.yaml`
+*Note:* If request/response headers or body values are missing in Moesif, Gloo requires explicit configuration in order to send that information to the Moesif ExtProc integration.  See the processingMode field of the above example settings command and `examples/extproc/extproc-gloo-settings.yaml`
 
 ## Additional Integrations
 
